@@ -1,22 +1,24 @@
-import telebot
-import requests
-import json
 import os
+import json
+import requests
 import time
 from datetime import datetime, timezone
 import threading
-from flask import Flask
+from flask import Flask, request
+import telebot
 
-# ===== Telegram Bot =====
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Ավելացրու Render-ում որպես Environment Variable
-if not BOT_TOKEN:
-    raise ValueError("Դուք պետք է ավելացնեք BOT_TOKEN որպես Environment Variable")
+# ===== Environment variables =====
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+if not BOT_TOKEN or not WEBHOOK_URL:
+    raise ValueError("Դուք պետք է ավելացնեք BOT_TOKEN և WEBHOOK_URL որպես Environment Variable")
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 USERS_FILE = "users.json"
 SENT_TX_FILE = "sent_txs.json"
 
-# ===== helpers =====
+# ===== Helpers =====
 def load_json(file):
     return json.load(open(file, "r", encoding="utf-8")) if os.path.exists(file) else {}
 
@@ -36,29 +38,29 @@ def get_dash_price_usd():
 
 def get_latest_txs(address):
     try:
-        r = requests.get(f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?limit=10", timeout=20)
+        r = requests.get(f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?limit=50", timeout=20)
         return r.json().get("txs", [])
     except:
         return []
 
-def format_alert(address, amount_dash, amount_usd, txid, timestamp, tx_number):
-    link = f"https://blockchair.com/dash/transaction/{txid}"
-    usd_text = f" (${amount_usd:.2f})" if amount_usd else ""
+def format_alert(tx, address, tx_number, price):
+    txid = tx["hash"]
+    total_received = sum([o["value"]/1e8 for o in tx.get("outputs", []) if address in (o.get("addresses") or [])])
+    usd_text = f" (${total_received*price:.2f})" if price else ""
+    timestamp = tx.get("confirmed")
+    timestamp = datetime.fromisoformat(timestamp.replace("Z","+00:00")).strftime("%Y-%m-%d %H:%M:%S") if timestamp else "Unknown"
     return (
         f"🔔 Նոր փոխանցում #{tx_number}!\n\n"
         f"📌 Address: {address}\n"
-        f"💰 Amount: {amount_dash:.8f} DASH{usd_text}\n"
+        f"💰 Amount: {total_received:.8f} DASH{usd_text}\n"
         f"🕒 Time: {timestamp}\n"
-        f"🔗 {link}\n\n"
-        f"Blockchair ({link})\n"
-        f"Dash transaction {txid}\n"
-        f"Inspect Dash transaction {txid}: check hash, date, and event details with Blockchair."
+        f"🔗 https://blockchair.com/dash/transaction/{txid}"
     )
 
 # ===== Telegram Handlers =====
-@bot.message_handler(commands=["start"])
+@bot.message_handler(commands=['start'])
 def start(msg):
-    bot.reply_to(msg, "Բարև 👋\nԳրի՛ր քո Dash հասցեն (սկսվում է X-ով):")
+    bot.reply_to(msg, "Բարև 👋 Գրի՛ր քո Dash հասցեն (սկսվում է X-ով)")
 
 @bot.message_handler(func=lambda m: m.text and m.text.startswith("X"))
 def save_address(msg):
@@ -68,52 +70,70 @@ def save_address(msg):
     if address not in users[user_id]:
         users[user_id].append(address)
     save_json(USERS_FILE, users)
+
     sent_txs.setdefault(user_id, {})
     sent_txs[user_id].setdefault(address, [])
+
+    # Ուղարկել միայն վերջին 10 TX-երը առաջին անգամ
+    txs = get_latest_txs(address)
+    price = get_dash_price_usd()
+    last_number = 0
+    for tx in reversed(txs[-10:]):  # վերջին 10 TX
+        last_number += 1
+        alert = format_alert(tx, address, last_number, price)
+        try:
+            bot.send_message(user_id, alert)
+        except:
+            pass
+        sent_txs[user_id][address].append({"txid": tx["hash"], "num": last_number})
+
     save_json(SENT_TX_FILE, sent_txs)
     bot.reply_to(msg, f"✅ Հասցեն {address} պահպանվեց!")
 
-# ===== Background monitor =====
+# ===== Background loop =====
 def monitor():
     while True:
         price = get_dash_price_usd()
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         for user_id, addresses in users.items():
             for address in addresses:
                 txs = get_latest_txs(address)
                 known = sent_txs.get(user_id, {}).get(address, [])
-                last_number = len(known)
-                for tx in reversed(txs):
-                    txid = tx.get("hash")
-                    if txid in known:
+                last_number = max([t["num"] for t in known], default=0)
+                for tx in reversed(txs[-10:]):  # ստուգել վերջին 10 TX
+                    if tx["hash"] in [t["txid"] for t in known]:
                         continue
-                    amount_dash = sum(out.get("value",0)/1e8 for out in tx.get("outputs", []) if address in (out.get("addresses") or []))
-                    if amount_dash <=0:
-                        continue
-                    amount_usd = amount_dash*price if price else None
                     last_number += 1
-                    alert_text = format_alert(address, amount_dash, amount_usd, txid, timestamp, last_number)
+                    alert = format_alert(tx, address, last_number, price)
                     try:
-                        bot.send_message(user_id, alert_text)
+                        bot.send_message(user_id, alert)
                     except Exception as e:
-                        print("Send error:", e)
-                    known.append(txid)
+                        print("Telegram send error:", e)
+                    known.append({"txid": tx["hash"], "num": last_number})
                 sent_txs.setdefault(user_id, {})[address] = known
         save_json(SENT_TX_FILE, sent_txs)
-        time.sleep(30)
+        time.sleep(15)
+
+threading.Thread(target=monitor, daemon=True).start()
 
 # ===== Flask server =====
 app = Flask(__name__)
+
 @app.route("/")
 def home():
     return "Bot is running!"
 
-def run_flask():
-    app.run(host="0.0.0.0", port=3000)
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    json_str = request.get_data().decode("utf-8")
+    update = telebot.types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+    return "OK", 200
 
-# ===== Start threads =====
-threading.Thread(target=monitor, daemon=True).start()
-threading.Thread(target=run_flask, daemon=True).start()
-bot.infinity_polling()
+bot.remove_webhook()
+bot.set_webhook(url=WEBHOOK_URL)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+
 
 
